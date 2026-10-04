@@ -1,0 +1,19 @@
+{
+  "name": "pathology-manifest-collab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cross-institution pathology manifest sharing service with identifier aliasing",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types src/index.ts",
+    "build": "node node_modules/typescript/bin/tsc -p tsconfig.json",
+    "test": "node --experimental-strip-types --test test/manifest.test.ts test/api.test.ts test/recovery.test.ts",
+    "verify": "node --experimental-strip-types scripts/verify.ts"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

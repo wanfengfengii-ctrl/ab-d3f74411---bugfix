@@ -1,0 +1,60 @@
+# Pathology manifest collaboration platform.
+#
+#   api:     long-running HTTP service (configurable host port, health check,
+#            persistent data volume)
+#   verify:  one-shot job that starts only after the API is healthy, runs code
+#            tests + TypeScript build + submit/query smoke, and exits with an
+#            aggregated status code (0 = all stages passed).
+#
+# Configuration via environment:
+#   API_HOST_PORT          host port published for the API (default 8080)
+#   MANIFEST_ALIAS_SECRET  deployment secret for deterministic aliases; if
+#                          omitted a random 32-byte secret is generated and
+#                          persisted in the data volume (single-node default)
+
+services:
+  api:
+    build:
+      context: .
+    image: pathology-manifests:latest
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8080"
+      DATA_DIR: /data
+      MANIFEST_ALIAS_SECRET: "${MANIFEST_ALIAS_SECRET:-}"
+      MAX_BODY_BYTES: "${MAX_BODY_BYTES:-10485760}"
+    ports:
+      - "${API_HOST_PORT:-8080}:8080"
+    volumes:
+      - manifest-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  verify:
+    image: pathology-manifests:latest
+    build:
+      context: .
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_BASE_URL: http://api:8080
+      APP_DIR: /app
+      DATA_DIR: /tmp/verify-data
+    command:
+      - node
+      - --experimental-strip-types
+      - scripts/verify.ts
+    restart: "no"
+
+volumes:
+  manifest-data:
