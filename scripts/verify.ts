@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { Aliaser } from "../src/alias.ts";
 import { contentHash } from "../src/canonical.ts";
+import { ISSUES_TRUNCATED_CODE, MAX_DIAGNOSTIC_ISSUES } from "../src/diagnostics.ts";
+import { validateSharedManifest } from "../src/sharedValidation.ts";
 import { CorruptStoreError, ManifestStore } from "../src/store.ts";
 import { transformBatch } from "../src/transform.ts";
 import { validateBatch } from "../src/validation.ts";
@@ -19,12 +21,14 @@ import { validateBatch } from "../src/validation.ts";
  *   2. TypeScript build (strict tsc type-check)
  *   3. recovery safety: valid manifests survive a restart, while corrupt
  *      restored entries (the restore-batch sample, duplicate aliases,
- *      unclosed references) abort the load without leaking raw identifiers
+ *      unclosed references, diagnostic floods) abort the load without
+ *      leaking raw identifiers and with bounded diagnostics
  *   4. submit/query smoke against the live API, including:
  *      - first submission -> 201, identical retry -> 200 with the same result
  *      - GET returns the stored document
  *      - cross-batch alias stability and per-category isolation
  *      - 409 on conflicting content, 422 on an invalid whole batch
+ *      - a 1000-violation batch -> bounded 422 with a truncation summary
  *      - no raw identifier value ever appears in a response
  */
 
@@ -80,7 +84,7 @@ async function getJson(path: string): Promise<{ status: number; json: any }> {
   return { status: res.status, json: await res.json() };
 }
 
-const RAW_VALUES = ["SMOKE-R1", "SMOKE-R2", "SMOKE-R3", "SMOKE-R9", "SMOKE-P1", "SMOKE-P2", "SMOKE-P9", "SMOKE-A1", "SMOKE-A2", "SMOKE-A9", "DUPVAL", "SMOKE-X", "SMOKE-PX", "SMOKE-PY", "SMOKE-AX", "SMOKE-AY", "GHOST"];
+const RAW_VALUES = ["SMOKE-R1", "SMOKE-R2", "SMOKE-R3", "SMOKE-R9", "SMOKE-P1", "SMOKE-P2", "SMOKE-P9", "SMOKE-A1", "SMOKE-A2", "SMOKE-A9", "DUPVAL", "SMOKE-X", "SMOKE-PX", "SMOKE-PY", "SMOKE-AX", "SMOKE-AY", "GHOST", "SMOKE-RF", "SMOKE-PF", "SMOKE-AF"];
 
 function assertNoRawLeak(label: string, value: unknown): void {
   const text = JSON.stringify(value);
@@ -210,6 +214,52 @@ async function runSmoke(): Promise<boolean> {
     assert(danglingRes.status === 422, `expected 422 for dangling reference, got ${danglingRes.status}`);
     assertNoRawLeak("dangling response", danglingRes.json);
 
+    // 8. Diagnostic flood: 1000 illegal measurement values (exactly the
+    //    measurement-key limit, so only the value types violate the
+    //    contract) -> bounded 422 with a machine-readable truncation summary.
+    const floodMeasurements: Record<string, unknown> = {};
+    for (let i = 0; i < 1000; i++) {
+      floodMeasurements[`m${String(i).padStart(4, "0")}`] = { nested: i };
+    }
+    const flood = {
+      batchId: "smoke-batch-flood",
+      records: [
+        { recordId: "SMOKE-RF", patientId: "SMOKE-PF", accessionId: "SMOKE-AF", relatedIds: [], measurements: floodMeasurements },
+      ],
+    };
+    const floodRequestText = JSON.stringify(flood);
+    const floodRes = await fetch(`${API_BASE_URL}/api/manifests`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: floodRequestText,
+    });
+    assert(floodRes.status === 422, `expected 422 for the flood batch, got ${floodRes.status}`);
+    const floodText = await floodRes.text();
+    const floodJson = JSON.parse(floodText);
+    assert(floodJson.error === "validation_failed", "flood batch must fail validation");
+    assertNoRawLeak("flood response", floodJson);
+    assert(
+      Array.isArray(floodJson.issues) && floodJson.issues.length <= MAX_DIAGNOSTIC_ISSUES + 1,
+      `flood diagnostics must be bounded to ${MAX_DIAGNOSTIC_ISSUES} issues plus a summary`,
+    );
+    assert(
+      floodText.length < floodRequestText.length,
+      "the 422 body must not amplify the rejected request",
+    );
+    assert(
+      floodJson.issues[0].path === "records[0].measurements.m0000",
+      "kept field-level issues must carry precise paths",
+    );
+    const floodSummary = floodJson.issues[floodJson.issues.length - 1];
+    assert(
+      floodSummary.code === ISSUES_TRUNCATED_CODE &&
+        typeof floodSummary.omitted === "number" &&
+        floodSummary.omitted > 0,
+      "a machine-readable truncation summary must report the omitted issue count",
+    );
+    const floodMissing = await getJson("/api/manifests/smoke-batch-flood");
+    assert(floodMissing.status === 404, "rejected flood batch must not be stored");
+
     process.stdout.write("--- verify: submit/query smoke OK\n");
     return true;
   } catch (err) {
@@ -337,6 +387,45 @@ async function runRecoverySmoke(): Promise<boolean> {
       }),
     );
     await expectCorruptLoad(danglingDir, "verify-recovery-dangling");
+
+    // 5. A restored entry carrying 1000 illegal measurement values is
+    //    rejected with bounded diagnostics: a capped issue list ending in a
+    //    machine-readable truncation summary, so the recovery log stays
+    //    small no matter how many violations the entry contains.
+    const floodDir = mkdtempSync(join(tmpdir(), "verify-recovery-flood-"));
+    const floodMeasurements: Record<string, unknown> = {};
+    for (let i = 0; i < 1000; i++) {
+      floodMeasurements[`m${String(i).padStart(4, "0")}`] = { nested: i };
+    }
+    const floodManifest = {
+      batchId: "verify-recovery-flood",
+      createdAt: "2026-10-04T00:00:00.000Z",
+      contentHash: "0".repeat(64),
+      records: [{ ...dupRecord, measurements: floodMeasurements }],
+    };
+    await writeFile(
+      join(floodDir, fileNameFor("verify-recovery-flood")),
+      JSON.stringify(floodManifest),
+    );
+    await expectCorruptLoad(floodDir, "verify-recovery-flood");
+    let floodIssues: Array<{ code: string; omitted?: number }> = [];
+    try {
+      validateSharedManifest(floodManifest);
+    } catch (err) {
+      floodIssues = (err as { issues?: typeof floodIssues }).issues ?? [];
+    }
+    assert(floodIssues.length > 0, "the flood manifest must fail contract validation");
+    assert(
+      floodIssues.length <= MAX_DIAGNOSTIC_ISSUES + 1,
+      "recovery diagnostics must be bounded",
+    );
+    const floodSummary = floodIssues[floodIssues.length - 1];
+    assert(
+      floodSummary.code === ISSUES_TRUNCATED_CODE &&
+        typeof floodSummary.omitted === "number" &&
+        floodSummary.omitted > 0,
+      "recovery diagnostics must end in a machine-readable truncation summary",
+    );
 
     process.stdout.write("--- verify: recovery safety OK\n");
     return true;

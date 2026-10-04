@@ -2,9 +2,9 @@ import type {
   InputBatch,
   InputRecord,
   MeasurementValue,
-  ValidationIssue,
 } from "./types.ts";
 import { ID_CLASSES, ValidationFailed } from "./types.ts";
+import { IssueCollector } from "./diagnostics.ts";
 
 /**
  * Strict structural validation for inbound manifests.
@@ -12,7 +12,9 @@ import { ID_CLASSES, ValidationFailed } from "./types.ts";
  * Every error intentionally reports a JSON PATH and a rule, never the offending
  * identifier value: validation messages are logged and returned to clients, so
  * echoing a malformed patient/accession/record id would itself be a privacy
- * leak.
+ * leak. The number of reported issues is bounded by the shared diagnostic cap
+ * (see diagnostics.ts) so a request full of violations cannot amplify itself
+ * into an unbounded 422 response.
  */
 
 const MAX_ID_LENGTH = 256;
@@ -31,18 +33,6 @@ export const FORBIDDEN_KEYS: ReadonlySet<string> = new Set([
   "constructor",
   "prototype",
 ]);
-
-class IssueCollector {
-  readonly issues: ValidationIssue[] = [];
-
-  add(code: string, path: string, message: string): void {
-    this.issues.push({ code, path, message });
-  }
-
-  get ok(): boolean {
-    return this.issues.length === 0;
-  }
-}
 
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

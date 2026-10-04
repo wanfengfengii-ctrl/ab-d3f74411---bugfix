@@ -4,6 +4,7 @@ import { Aliaser } from "../src/alias.ts";
 import { contentHash, canonicalize } from "../src/canonical.ts";
 import { transformBatch } from "../src/transform.ts";
 import { validateBatch } from "../src/validation.ts";
+import { ISSUES_TRUNCATED_CODE, MAX_DIAGNOSTIC_ISSUES } from "../src/diagnostics.ts";
 import { ManifestStore } from "../src/store.ts";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -224,6 +225,63 @@ test("validation rejects illegal structures and never echoes identifier values",
   } catch (err) {
     const text = JSON.stringify((err as { issues: unknown }).issues);
     assert.ok(!text.includes("SUPER-SECRET-ID"));
+  }
+});
+
+test("diagnostics are capped with a machine-readable truncation summary", () => {
+  // 1000 illegal values (exactly MAX_MEASUREMENT_KEYS keys, so only the
+  // value types violate the contract) must not produce 1000 issues.
+  const measurements: Record<string, unknown> = {};
+  for (let i = 0; i < 1000; i++) {
+    measurements[`m${String(i).padStart(4, "0")}`] = [i];
+  }
+  const body = validBody({
+    batchId: "batch-flood",
+    records: [
+      { recordId: "r1", patientId: "p1", accessionId: "a1", relatedIds: [], measurements },
+    ],
+  });
+
+  try {
+    validateBatch(body);
+    assert.fail("should have thrown");
+  } catch (err) {
+    const issues = (err as { issues: Array<{ code: string; path: string; omitted?: number }> }).issues;
+    assert.equal(issues.length, MAX_DIAGNOSTIC_ISSUES + 1);
+    // Kept field-level issues still carry precise paths.
+    assert.equal(issues[0].code, "measurement_invalid_type");
+    assert.equal(issues[0].path, "records[0].measurements.m0000");
+    // The final entry summarizes the truncated tail for machines.
+    const summary = issues[issues.length - 1];
+    assert.equal(summary.code, ISSUES_TRUNCATED_CODE);
+    assert.equal(summary.omitted, 1000 - MAX_DIAGNOSTIC_ISSUES);
+  }
+});
+
+test("diagnostics below the cap stay complete and carry no truncation summary", () => {
+  const body = validBody({
+    batchId: "batch-few",
+    records: [
+      {
+        recordId: "r1",
+        patientId: "p1",
+        accessionId: "a1",
+        relatedIds: [],
+        measurements: { a: [1], b: { x: 1 }, c: [2] },
+      },
+    ],
+  });
+  try {
+    validateBatch(body);
+    assert.fail("should have thrown");
+  } catch (err) {
+    const issues = (err as { issues: Array<{ code: string; path: string }> }).issues;
+    assert.equal(issues.length, 3);
+    assert.deepEqual(
+      issues.map((i) => i.path),
+      ["records[0].measurements.a", "records[0].measurements.b", "records[0].measurements.c"],
+    );
+    assert.ok(!issues.some((i) => i.code === ISSUES_TRUNCATED_CODE));
   }
 });
 

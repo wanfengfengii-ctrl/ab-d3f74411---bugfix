@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Aliaser } from "../src/alias.ts";
 import { contentHash } from "../src/canonical.ts";
+import { ISSUES_TRUNCATED_CODE, MAX_DIAGNOSTIC_ISSUES } from "../src/diagnostics.ts";
 import { validateSharedManifest } from "../src/sharedValidation.ts";
 import { CorruptStoreError, ManifestStore } from "../src/store.ts";
 import { transformBatch } from "../src/transform.ts";
@@ -187,6 +188,76 @@ test("recovery: syntactically broken JSON entries abort startup too", async () =
 
   const store = new ManifestStore(dir);
   await assert.rejects(store.load(), CorruptStoreError);
+});
+
+test("recovery: a flood of illegal measurements aborts startup with bounded diagnostics", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-flood-"));
+  const measurements: Record<string, unknown> = {};
+  for (let i = 0; i < 1000; i++) {
+    measurements[`m${String(i).padStart(4, "0")}`] = { nested: i };
+  }
+  const floodManifest = {
+    batchId: "batch-flood-recovery",
+    createdAt: "2026-10-04T00:00:00.000Z",
+    contentHash: "0".repeat(64),
+    records: [
+      {
+        recordAlias: `rec-${"a".repeat(32)}`,
+        patientAlias: `pat-${"b".repeat(32)}`,
+        accessionAlias: `acc-${"c".repeat(32)}`,
+        relatedAliases: [],
+        measurements,
+      },
+    ],
+  };
+  await writeEntry(dir, fileNameFor("batch-flood-recovery"), floodManifest);
+
+  // Capture the recovery diagnostics emitted to stderr while loading.
+  const originalWrite = process.stderr.write;
+  let captured = "";
+  process.stderr.write = ((chunk: unknown) => {
+    captured += String(chunk);
+    return true;
+  }) as typeof process.stderr.write;
+  const store = new ManifestStore(dir);
+  let failure: unknown;
+  try {
+    await store.load();
+  } catch (err) {
+    failure = err;
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+
+  // The corrupt entry is still rejected outright and never admitted.
+  assert.ok(failure instanceof CorruptStoreError, "corrupt entry must abort the load");
+  assert.equal(store.get("batch-flood-recovery"), undefined);
+
+  // The contract validator reports a bounded issue list ending in a
+  // machine-readable truncation summary.
+  let issues: Array<{ code: string; path: string; omitted?: number }> = [];
+  try {
+    validateSharedManifest(floodManifest);
+    assert.fail("flood manifest must fail contract validation");
+  } catch (err) {
+    issues = (err as { issues: typeof issues }).issues;
+  }
+  assert.equal(issues.length, MAX_DIAGNOSTIC_ISSUES + 1);
+  assert.equal(issues[0].path, "records[0].measurements.m0000");
+  const summary = issues[issues.length - 1];
+  assert.equal(summary.code, ISSUES_TRUNCATED_CODE);
+  assert.equal(summary.omitted, 1000 - MAX_DIAGNOSTIC_ISSUES);
+
+  // The recovery log line is bounded too: the capped list is emitted once,
+  // the summary is included, and no measurement values are echoed.
+  assert.ok(captured.includes("store_corrupt_entry"));
+  const valueIssues = captured.split('"invalid_measurement_value"').length - 1;
+  assert.ok(
+    valueIssues <= MAX_DIAGNOSTIC_ISSUES,
+    `recovery log must not list more than ${MAX_DIAGNOSTIC_ISSUES} field issues, got ${valueIssues}`,
+  );
+  assert.ok(captured.includes(ISSUES_TRUNCATED_CODE));
+  assert.ok(!captured.includes("nested"), "recovery log must not echo measurement values");
 });
 
 test("shared manifest contract: field set, formats and scalar measurements", () => {

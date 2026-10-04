@@ -44,6 +44,12 @@ export interface ValidationIssue {
   code: string;
   path: string;
   message: string;
+  /**
+   * Present only on the truncation summary entry (code "issues_truncated",
+   * see diagnostics.ts): how many further issues were detected but not
+   * reported. Never present on regular field-level issues.
+   */
+  omitted?: number;
 }
 
 /** Payload failed structural / referential validation -> HTTP 422. */

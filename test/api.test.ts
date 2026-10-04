@@ -4,6 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAppServer } from "../src/http.ts";
+import { MAX_DIAGNOSTIC_ISSUES, ISSUES_TRUNCATED_CODE } from "../src/diagnostics.ts";
 import { ManifestStore } from "../src/store.ts";
 
 const SECRET = Buffer.from("0123456789abcdef0123456789abcdef", "utf8");
@@ -160,6 +161,85 @@ test("an oversized body is rejected with 413 and still produces a response", asy
   };
   const { status } = await post(oversized);
   assert.equal(status, 413);
+});
+
+test("a flood of illegal measurement values yields a bounded 422 with a truncation summary", async () => {
+  // 1000 keys = exactly MAX_MEASUREMENT_KEYS, so only the value types violate
+  // the contract; the request itself is small (~23 KB).
+  const measurements: Record<string, unknown> = {};
+  for (let i = 0; i < 1000; i++) {
+    measurements[`m${String(i).padStart(4, "0")}`] = { nested: i };
+  }
+  const body = {
+    batchId: "batch-flood",
+    records: [
+      {
+        recordId: "R-flood",
+        patientId: "P-flood",
+        accessionId: "A-flood",
+        relatedIds: [],
+        measurements,
+      },
+    ],
+  };
+  const requestText = JSON.stringify(body);
+  const res = await fetch(`${baseUrl}/api/manifests`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: requestText,
+  });
+  assert.equal(res.status, 422);
+  const responseText = await res.text();
+  const json = JSON.parse(responseText);
+  assert.equal(json.error, "validation_failed");
+
+  // The diagnostics are bounded: 1000 violations collapse into the capped
+  // field-level list plus one machine-readable truncation summary, and the
+  // response no longer amplifies the request.
+  assert.ok(
+    json.issues.length <= MAX_DIAGNOSTIC_ISSUES + 1,
+    `expected at most ${MAX_DIAGNOSTIC_ISSUES + 1} issues, got ${json.issues.length}`,
+  );
+  assert.ok(
+    responseText.length < requestText.length,
+    "the 422 body must stay smaller than the rejected request",
+  );
+
+  // Kept field-level issues still carry precise paths, and the key-count
+  // boundary (1000 keys allowed) is untouched.
+  assert.equal(json.issues[0].path, "records[0].measurements.m0000");
+  assert.equal(json.issues[0].code, "measurement_invalid_type");
+  assert.ok(!json.issues.some((i: any) => i.code === "too_many_measurements"));
+
+  // The final entry is the machine-readable truncation summary.
+  const summary = json.issues[json.issues.length - 1];
+  assert.equal(summary.code, ISSUES_TRUNCATED_CODE);
+  assert.equal(summary.omitted, 1000 - MAX_DIAGNOSTIC_ISSUES);
+
+  // Diagnostics must not echo untrusted values, and nothing is stored.
+  assert.ok(!responseText.includes("nested"), "422 body must not echo measurement values");
+  const missing = await fetch(`${baseUrl}/api/manifests/batch-flood`);
+  assert.equal(missing.status, 404);
+});
+
+test("a small number of field errors keeps every precise path without truncation", async () => {
+  const { status, json } = await post({
+    batchId: "batch-few-errors",
+    records: [
+      {
+        recordId: "R-few",
+        patientId: 42, // invalid_patient_id
+        accessionId: "A-few",
+        relatedIds: [],
+        measurements: { bad: { x: 1 } }, // measurement_invalid_type
+      },
+    ],
+  });
+  assert.equal(status, 422);
+  assert.equal(json.issues.length, 2, "every field error must be reported precisely");
+  const paths = json.issues.map((i: any) => i.path).sort();
+  assert.deepEqual(paths, ["records[0].measurements.bad", "records[0].patientId"]);
+  assert.ok(!json.issues.some((i: any) => i.code === ISSUES_TRUNCATED_CODE));
 });
 
 test("aliases stay consistent across batches while identifier classes stay isolated", async () => {

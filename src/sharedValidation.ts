@@ -2,9 +2,9 @@ import type {
   MeasurementValue,
   SharedManifest,
   SharedRecord,
-  ValidationIssue,
 } from "./types.ts";
 import { CorruptManifestError } from "./types.ts";
+import { IssueCollector } from "./diagnostics.ts";
 import {
   BATCH_ID_PATTERN,
   FORBIDDEN_KEYS,
@@ -37,7 +37,9 @@ import {
  *
  * As with the inbound validator, issues report JSON paths and rule codes
  * only, never the offending values: a corrupt entry may be precisely the
- * place where raw identifiers live.
+ * place where raw identifiers live. The number of reported issues is bounded
+ * by the same shared diagnostic cap as the request path (see diagnostics.ts),
+ * so one corrupt entry cannot flood the recovery logs.
  */
 
 const CREATED_AT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -45,18 +47,6 @@ const CONTENT_HASH_PATTERN = /^[0-9a-f]{64}$/;
 const RECORD_ALIAS_PATTERN = /^rec-[0-9a-f]{32}$/;
 const PATIENT_ALIAS_PATTERN = /^pat-[0-9a-f]{32}$/;
 const ACCESSION_ALIAS_PATTERN = /^acc-[0-9a-f]{32}$/;
-
-class IssueCollector {
-  readonly issues: ValidationIssue[] = [];
-
-  add(code: string, path: string, message: string): void {
-    this.issues.push({ code, path, message });
-  }
-
-  get ok(): boolean {
-    return this.issues.length === 0;
-  }
-}
 
 function isValidCreatedAt(value: string): boolean {
   if (!CREATED_AT_PATTERN.test(value)) return false;

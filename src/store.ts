@@ -80,7 +80,9 @@ export class ManifestStore {
     }
     // Report every corrupt entry before aborting so a single restart cycle
     // surfaces all of them. The diagnostics contain only hashed file names,
-    // rule codes and JSON paths — corrupt content itself is never logged.
+    // rule codes and JSON paths — corrupt content itself is never logged —
+    // and each entry's issue list is bounded by the shared diagnostic cap
+    // (see diagnostics.ts), so a deeply corrupt entry cannot flood the logs.
     for (const entry of corrupt) {
       log.error("store_corrupt_entry", {
         file: entry.file,
