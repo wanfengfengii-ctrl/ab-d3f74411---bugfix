@@ -2,9 +2,9 @@ import type {
   InputBatch,
   InputRecord,
   MeasurementValue,
-  ValidationIssue,
 } from "./types.ts";
 import { ID_CLASSES, ValidationFailed } from "./types.ts";
+import { IssueCollector } from "./diagnostics.ts";
 
 /**
  * Strict structural validation for inbound manifests.
@@ -31,18 +31,6 @@ export const FORBIDDEN_KEYS: ReadonlySet<string> = new Set([
   "constructor",
   "prototype",
 ]);
-
-class IssueCollector {
-  readonly issues: ValidationIssue[] = [];
-
-  add(code: string, path: string, message: string): void {
-    this.issues.push({ code, path, message });
-  }
-
-  get ok(): boolean {
-    return this.issues.length === 0;
-  }
-}
 
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -213,7 +201,11 @@ function validateRecord(raw: unknown, index: number, issues: IssueCollector): In
 
 /**
  * Validate and normalize a parsed request body. Throws {@link ValidationFailed}
- * (collecting every issue found) on any structural or referential violation.
+ * on any structural or referential violation. Field-level issues are bounded
+ * by the shared diagnostic cap (see diagnostics.ts): every violation still
+ * rejects the whole batch, but at most MAX_DIAGNOSTIC_ISSUES issues are
+ * retained, with a machine-readable truncation summary naming the remaining
+ * count. No issue or summary ever echoes a submitted field value.
  */
 export function validateBatch(raw: unknown): InputBatch {
   const issues = new IssueCollector();
@@ -284,7 +276,7 @@ export function validateBatch(raw: unknown): InputBatch {
     });
   });
 
-  if (!issues.ok) throw new ValidationFailed(issues.issues);
+  if (!issues.ok) throw new ValidationFailed(issues.issues, issues.summary());
   return { batchId, records };
 }
 

@@ -9,6 +9,9 @@ import { contentHash } from "../src/canonical.ts";
 import { CorruptStoreError, ManifestStore } from "../src/store.ts";
 import { transformBatch } from "../src/transform.ts";
 import { validateBatch } from "../src/validation.ts";
+import { validateSharedManifest } from "../src/sharedValidation.ts";
+import { CorruptManifestError } from "../src/types.ts";
+import { MAX_DIAGNOSTIC_ISSUES } from "../src/diagnostics.ts";
 
 /**
  * One-shot verification entrypoint (the `verify` compose service).
@@ -25,6 +28,9 @@ import { validateBatch } from "../src/validation.ts";
  *      - GET returns the stored document
  *      - cross-batch alias stability and per-category isolation
  *      - 409 on conflicting content, 422 on an invalid whole batch
+ *      - a thousand invalid measurement values: the 422 diagnostics are
+ *        capped with a machine-readable truncation summary and a bounded
+ *        body, while few field errors still return every exact path
  *      - no raw identifier value ever appears in a response
  */
 
@@ -210,6 +216,64 @@ async function runSmoke(): Promise<boolean> {
     assert(danglingRes.status === 422, `expected 422 for dangling reference, got ${danglingRes.status}`);
     assertNoRawLeak("dangling response", danglingRes.json);
 
+    // 8. A thousand non-scalar measurements: key count and body size stay
+    // within their limits, but diagnostics must be capped with an explicit
+    // truncation summary and the 422 body must not amplify the request.
+    const manyMeasurements: Record<string, unknown> = {};
+    for (let i = 0; i < 1000; i++) {
+      manyMeasurements[`m${String(i).padStart(4, "0")}`] = { secretMarker: "SMOKE-SECRET-VALUE" };
+    }
+    const many = {
+      batchId: "smoke-batch-many",
+      records: [
+        { recordId: "SMOKE-RM", patientId: "SMOKE-PM", accessionId: "SMOKE-AM", relatedIds: [], measurements: manyMeasurements },
+      ],
+    };
+    const requestBytes = JSON.stringify(many).length;
+    assert(requestBytes < 100 * 1024, "fixture must stay well under the body size limit");
+    const manyRes = await postJson("/api/manifests", many);
+    assert(manyRes.status === 422, `expected 422 for invalid values, got ${manyRes.status}`);
+    assert(Array.isArray(manyRes.json.issues), "issues must be an array");
+    assert(manyRes.json.issues.length === MAX_DIAGNOSTIC_ISSUES, "field issues must be capped");
+    assert(
+      manyRes.json.issues[0].path === "records[0].measurements.m0000" &&
+        manyRes.json.issues.at(-1).path ===
+          `records[0].measurements.m${String(MAX_DIAGNOSTIC_ISSUES - 1).padStart(4, "0")}`,
+      "retained paths must be deterministic",
+    );
+    const trunc = manyRes.json.truncated;
+    assert(
+      trunc &&
+        trunc.code === "issues_truncated" &&
+        trunc.limit === MAX_DIAGNOSTIC_ISSUES &&
+        trunc.reported === MAX_DIAGNOSTIC_ISSUES &&
+        trunc.remaining === 1000 - MAX_DIAGNOSTIC_ISSUES,
+      "a machine-readable truncation summary must name the remaining issue count",
+    );
+    assert(
+      JSON.stringify(manyRes.json).length < requestBytes,
+      "422 body must be smaller than the rejected request",
+    );
+    assert(!JSON.stringify(manyRes.json).includes("SMOKE-SECRET-VALUE"), "422 must not echo field values");
+    const manyGet = await getJson("/api/manifests/smoke-batch-many");
+    assert(manyGet.status === 404, "rejected batch must not be stored");
+
+    // 9. Few field errors: every exact path, no truncation marker.
+    const few = {
+      batchId: "smoke-batch-few",
+      records: [
+        { recordId: "SMOKE-RF", patientId: "SMOKE-PF", accessionId: "SMOKE-AF", relatedIds: [], measurements: { only: ["x"] } },
+      ],
+    };
+    const fewRes = await postJson("/api/manifests", few);
+    assert(fewRes.status === 422, `expected 422, got ${fewRes.status}`);
+    assert(fewRes.json.issues.length === 1, "all exact issues must be reported below the cap");
+    assert(
+      fewRes.json.issues[0].path === "records[0].measurements.only",
+      "few errors must retain the exact field path",
+    );
+    assert(fewRes.json.truncated === undefined, "no truncation summary below the cap");
+
     process.stdout.write("--- verify: submit/query smoke OK\n");
     return true;
   } catch (err) {
@@ -226,6 +290,9 @@ async function runSmoke(): Promise<boolean> {
  *   - the confirmed corrupt restore-batch sample aborts the load, is never
  *     served, and its raw identifiers never appear in diagnostics
  *   - duplicate record aliases and unclosed references are rejected
+ *   - a restored entry with a thousand invalid values aborts the load with
+ *     bounded, truncated diagnostics (capped issue list + remaining count
+ *     in the log), never echoing the corrupt values
  */
 async function runRecoverySmoke(): Promise<boolean> {
   process.stdout.write("\n=== verify: recovery safety ===\n");
@@ -337,6 +404,68 @@ async function runRecoverySmoke(): Promise<boolean> {
       }),
     );
     await expectCorruptLoad(danglingDir, "verify-recovery-dangling");
+
+    // 5. A restored entry with a thousand non-scalar measurements aborts the
+    // load too, and the recovery diagnostics are bounded exactly like the
+    // request path: capped field issues + truncation summary, never values.
+    const manyDir = mkdtempSync(join(tmpdir(), "verify-recovery-many-"));
+    const manyMeasurements: Record<string, unknown> = {};
+    for (let i = 0; i < 1000; i++) {
+      manyMeasurements[`m${String(i).padStart(4, "0")}`] = { secretMarker: "RECOVERY-SECRET-VALUE" };
+    }
+    const manyEntry = {
+      batchId: "verify-recovery-many",
+      createdAt: "2026-10-04T00:00:00.000Z",
+      contentHash: "0".repeat(64),
+      records: [{ ...dupRecord, measurements: manyMeasurements }],
+    };
+    let contractErr: unknown;
+    try {
+      validateSharedManifest(JSON.parse(JSON.stringify(manyEntry)));
+    } catch (err) {
+      contractErr = err;
+    }
+    assert(contractErr instanceof CorruptManifestError, "many-bad entry must fail contract validation");
+    const ce = contractErr as InstanceType<typeof CorruptManifestError>;
+    assert(ce.issues.length === MAX_DIAGNOSTIC_ISSUES, "recovery field issues must be capped");
+    assert(
+      ce.truncation !== null &&
+        ce.truncation.code === "issues_truncated" &&
+        ce.truncation.remaining === 1000 - MAX_DIAGNOSTIC_ISSUES,
+      "recovery diagnostics must carry a truncation summary",
+    );
+    assert(!JSON.stringify(ce.issues).includes("RECOVERY-SECRET-VALUE"), "recovery issues must not echo values");
+
+    await writeFile(
+      join(manyDir, fileNameFor("verify-recovery-many")),
+      JSON.stringify(manyEntry),
+    );
+    const captured: string[] = [];
+    const originalStderrWrite = process.stderr.write.bind(process.stderr);
+    (process.stderr as { write: any }).write = (chunk: string): boolean => {
+      captured.push(String(chunk));
+      return true;
+    };
+    let manyLoadFailure: unknown;
+    try {
+      await expectCorruptLoad(manyDir, "verify-recovery-many");
+    } catch (err) {
+      manyLoadFailure = err;
+    } finally {
+      (process.stderr as { write: any }).write = originalStderrWrite;
+    }
+    assert(manyLoadFailure === undefined, "the many-bad entry must abort the load");
+    const corruptLogLine = captured
+      .map((line) => line.trim())
+      .find((line) => line.includes('"event":"store_corrupt_entry"'));
+    assert(corruptLogLine !== undefined, "a bounded corrupt-entry log line must be emitted");
+    if (corruptLogLine !== undefined) {
+      const logged = JSON.parse(corruptLogLine);
+      assert(JSON.parse(logged.issues).length === MAX_DIAGNOSTIC_ISSUES, "logged issues must be capped");
+      assert(logged.issues_remaining === 1000 - MAX_DIAGNOSTIC_ISSUES, "log must name remaining issues");
+      assert(!corruptLogLine.includes("RECOVERY-SECRET-VALUE"), "log must not echo corrupt values");
+      assert(corruptLogLine.length < 64 * 1024, "recovery log line must be bounded");
+    }
 
     process.stdout.write("--- verify: recovery safety OK\n");
     return true;

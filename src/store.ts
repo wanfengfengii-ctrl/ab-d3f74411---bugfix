@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { SharedManifest, ValidationIssue } from "./types.ts";
+import type { IssueTruncation, SharedManifest, ValidationIssue } from "./types.ts";
 import { CorruptManifestError } from "./types.ts";
 import { validateSharedManifest } from "./sharedValidation.ts";
 import { log } from "./log.ts";
@@ -67,24 +67,36 @@ export class ManifestStore {
 
   async load(): Promise<void> {
     const entries = await readdir(this.dataDir);
-    const corrupt: Array<{ file: string; issues: ValidationIssue[] }> = [];
+    const corrupt: Array<{
+      file: string;
+      issues: ValidationIssue[];
+      truncation: IssueTruncation | null;
+    }> = [];
     let count = 0;
     for (const entry of entries.sort()) {
       if (!entry.endsWith(".json")) continue;
-      const issues = await this.inspectEntry(entry);
-      if (issues.length > 0) {
-        corrupt.push({ file: entry, issues });
+      const verdict = await this.inspectEntry(entry);
+      if (verdict.issues.length > 0) {
+        corrupt.push({ file: entry, issues: verdict.issues, truncation: verdict.truncation });
       } else {
         count++;
       }
     }
     // Report every corrupt entry before aborting so a single restart cycle
     // surfaces all of them. The diagnostics contain only hashed file names,
-    // rule codes and JSON paths — corrupt content itself is never logged.
+    // rule codes and JSON paths — corrupt content itself is never logged —
+    // and the issue list per entry is capped (see diagnostics.ts), with a
+    // truncation summary naming how many further issues remain unreported.
     for (const entry of corrupt) {
       log.error("store_corrupt_entry", {
         file: entry.file,
         issues: JSON.stringify(entry.issues),
+        ...(entry.truncation
+          ? {
+              issues_remaining: entry.truncation.remaining,
+              issues_limit: entry.truncation.limit,
+            }
+          : {}),
       });
     }
     if (corrupt.length > 0) {
@@ -95,50 +107,55 @@ export class ManifestStore {
 
   /**
    * Validate one persisted entry. Returns the list of contract violations
-   * (empty when the entry is trustworthy); only fully valid entries are
-   * admitted into the in-memory index.
+   * (empty when the entry is trustworthy) and, when the issue cap was hit, a
+   * truncation summary; only fully valid entries are admitted into the
+   * in-memory index.
    */
-  private async inspectEntry(entry: string): Promise<ValidationIssue[]> {
+  private async inspectEntry(entry: string): Promise<{
+    issues: ValidationIssue[];
+    truncation: IssueTruncation | null;
+  }> {
+    const readIssue = (code: string, path: string, message: string): {
+      issues: ValidationIssue[];
+      truncation: IssueTruncation | null;
+    } => ({ issues: [{ code, path, message }], truncation: null });
+
     let raw: string;
     try {
       raw = await readFile(join(this.dataDir, entry), "utf8");
     } catch {
-      return [
-        { code: "unreadable_entry", path: "$", message: "persisted manifest could not be read" },
-      ];
+      return readIssue("unreadable_entry", "$", "persisted manifest could not be read");
     }
 
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      return [
-        { code: "invalid_json", path: "$", message: "persisted manifest is not valid JSON" },
-      ];
+      return readIssue("invalid_json", "$", "persisted manifest is not valid JSON");
     }
 
     let manifest: SharedManifest;
     try {
       manifest = validateSharedManifest(parsed);
     } catch (err) {
-      if (err instanceof CorruptManifestError) return err.issues;
+      if (err instanceof CorruptManifestError) {
+        return { issues: err.issues, truncation: err.truncation };
+      }
       throw err;
     }
 
     // The storage key is part of the contract: the file name must be the
     // SHA-256 of the batchId it claims to hold.
     if (entry !== this.fileName(manifest.batchId)) {
-      return [
-        {
-          code: "batch_id_file_mismatch",
-          path: "$.batchId",
-          message: "batchId does not match the persisted file name binding",
-        },
-      ];
+      return readIssue(
+        "batch_id_file_mismatch",
+        "$.batchId",
+        "batchId does not match the persisted file name binding",
+      );
     }
 
     this.manifests.set(manifest.batchId, manifest);
-    return [];
+    return { issues: [], truncation: null };
   }
 
   get(batchId: string): SharedManifest | undefined {

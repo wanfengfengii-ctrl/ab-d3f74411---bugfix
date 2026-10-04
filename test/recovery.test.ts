@@ -9,7 +9,9 @@ import { Aliaser } from "../src/alias.ts";
 import { contentHash } from "../src/canonical.ts";
 import { validateSharedManifest } from "../src/sharedValidation.ts";
 import { CorruptStoreError, ManifestStore } from "../src/store.ts";
+import { MAX_DIAGNOSTIC_ISSUES } from "../src/diagnostics.ts";
 import { transformBatch } from "../src/transform.ts";
+import { CorruptManifestError } from "../src/types.ts";
 import { validateBatch } from "../src/validation.ts";
 
 const SECRET = Buffer.from("0123456789abcdef0123456789abcdef", "utf8");
@@ -179,6 +181,80 @@ test("recovery: file name must match the SHA-256 binding of its batchId", async 
   const store = new ManifestStore(dir);
   await assert.rejects(store.load(), CorruptStoreError);
   assert.equal(store.get("batch-binding"), undefined);
+});
+
+test("recovery: a restored entry with a thousand invalid values yields bounded diagnostics", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-many-"));
+  const keyCount = 1000;
+  const measurements: Record<string, unknown> = {};
+  for (let i = 0; i < keyCount; i++) {
+    measurements[`m${String(i).padStart(4, "0")}`] = { secretMarker: "DO-NOT-ECHO" };
+  }
+  const entry = {
+    batchId: "batch-many-bad",
+    createdAt: "2026-10-04T00:00:00.000Z",
+    contentHash: "0".repeat(64),
+    records: [
+      {
+        recordAlias: `rec-${"a".repeat(32)}`,
+        patientAlias: `pat-${"b".repeat(32)}`,
+        accessionAlias: `acc-${"c".repeat(32)}`,
+        relatedAliases: [],
+        measurements,
+      },
+    ],
+  };
+  await writeEntry(dir, fileNameFor("batch-many-bad"), entry);
+
+  // The shared contract validator applies the same deterministic cap.
+  let contractFailure: unknown;
+  try {
+    validateSharedManifest(JSON.parse(JSON.stringify(entry)));
+  } catch (err) {
+    contractFailure = err;
+  }
+  assert.ok(contractFailure instanceof CorruptManifestError);
+  const corruptErr = contractFailure as InstanceType<typeof CorruptManifestError>;
+  assert.equal(corruptErr.issues.length, MAX_DIAGNOSTIC_ISSUES);
+  assert.deepEqual(corruptErr.truncation, {
+    code: "issues_truncated",
+    limit: MAX_DIAGNOSTIC_ISSUES,
+    reported: MAX_DIAGNOSTIC_ISSUES,
+    remaining: keyCount - MAX_DIAGNOSTIC_ISSUES,
+  });
+  assert.ok(!JSON.stringify(corruptErr.issues).includes("DO-NOT-ECHO"));
+
+  // Startup aborts and the recovery log line is itself bounded, carries the
+  // truncation summary, and never contains the corrupt values.
+  const captured: string[] = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  (process.stderr as { write: any }).write = (chunk: string): boolean => {
+    captured.push(String(chunk));
+    return true;
+  };
+  const store = new ManifestStore(dir);
+  let failure: unknown;
+  try {
+    await store.load();
+  } catch (err) {
+    failure = err;
+  } finally {
+    (process.stderr as { write: any }).write = originalWrite;
+  }
+  assert.ok(failure instanceof CorruptStoreError, "the corrupt entry must abort load");
+  assert.equal(store.get("batch-many-bad"), undefined, "it must never be admitted");
+
+  const logLine = captured
+    .map((line) => line.trim())
+    .find((line) => line.includes('"event":"store_corrupt_entry"'));
+  assert.ok(logLine !== undefined, "a bounded corrupt-entry diagnostic must be logged");
+  if (logLine === undefined) throw new Error("unreachable");
+  const logged = JSON.parse(logLine);
+  assert.equal(JSON.parse(logged.issues).length, MAX_DIAGNOSTIC_ISSUES);
+  assert.equal(logged.issues_remaining, keyCount - MAX_DIAGNOSTIC_ISSUES);
+  assert.equal(logged.issues_limit, MAX_DIAGNOSTIC_ISSUES);
+  assert.ok(!logLine.includes("DO-NOT-ECHO"), "log must not echo corrupt values");
+  assert.ok(logLine.length < 64 * 1024, "recovery log line must be bounded");
 });
 
 test("recovery: syntactically broken JSON entries abort startup too", async () => {

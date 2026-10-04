@@ -143,8 +143,19 @@ export function createAppServer(deps: ServerDeps) {
     } catch (err) {
       if (res.headersSent) return;
       if (err instanceof ValidationFailed) {
-        sendJson(res, 422, { error: "validation_failed", issues: err.issues });
-        log.warn("manifest_rejected", { issues: err.issues.length });
+        // The issue list is capped (see diagnostics.ts); when more issues
+        // exist, the machine-readable summary names the unreported count so
+        // callers know the diagnostics are incomplete. The body stays bounded
+        // regardless of how many values were invalid.
+        sendJson(res, 422, {
+          error: "validation_failed",
+          issues: err.issues,
+          ...(err.truncation ? { truncated: err.truncation } : {}),
+        });
+        log.warn("manifest_rejected", {
+          issues: err.issues.length,
+          issues_remaining: err.truncation?.remaining ?? 0,
+        });
         return;
       }
       if (err instanceof BatchConflictError) {

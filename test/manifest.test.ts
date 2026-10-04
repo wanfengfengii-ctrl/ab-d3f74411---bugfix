@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { Aliaser } from "../src/alias.ts";
 import { contentHash, canonicalize } from "../src/canonical.ts";
 import { transformBatch } from "../src/transform.ts";
-import { validateBatch } from "../src/validation.ts";
+import { ValidationFailed } from "../src/types.ts";
+import { validateBatch, MAX_MEASUREMENT_KEYS } from "../src/validation.ts";
+import { MAX_DIAGNOSTIC_ISSUES } from "../src/diagnostics.ts";
 import { ManifestStore } from "../src/store.ts";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -224,6 +226,90 @@ test("validation rejects illegal structures and never echoes identifier values",
   } catch (err) {
     const text = JSON.stringify((err as { issues: unknown }).issues);
     assert.ok(!text.includes("SUPER-SECRET-ID"));
+  }
+});
+
+test("thousands of invalid measurement values yield a bounded, truncated 422 diagnostics set", () => {
+  // Stays below MAX_MEASUREMENT_KEYS and (serialized) below the default
+  // MAX_BODY_BYTES, so size/key limits cannot be what rejects the batch.
+  const keyCount = 1000;
+  assert.ok(keyCount <= MAX_MEASUREMENT_KEYS);
+  const measurements: Record<string, unknown> = {};
+  for (let i = 0; i < keyCount; i++) {
+    measurements[`m${String(i).padStart(4, "0")}`] = { secretMarker: "DO-NOT-ECHO" };
+  }
+  const body: Record<string, unknown> = {
+    batchId: "batch-thousand",
+    records: [
+      { recordId: "R-1", patientId: "P-1", accessionId: "A-1", relatedIds: [], measurements },
+    ],
+  };
+  assert.ok(JSON.stringify(body).length < 100 * 1024);
+
+  let thrown: unknown;
+  try {
+    validateBatch(body);
+  } catch (err) {
+    thrown = err;
+  }
+  assert.ok(thrown instanceof ValidationFailed, "batch must still be rejected");
+  const err = thrown as InstanceType<typeof ValidationFailed>;
+
+  assert.equal(err.issues.length, MAX_DIAGNOSTIC_ISSUES);
+  // Deterministic retention: object-key insertion order, first cap keys.
+  assert.equal(err.issues[0].path, "records[0].measurements.m0000");
+  assert.equal(
+    err.issues.at(-1)?.path,
+    `records[0].measurements.m${String(MAX_DIAGNOSTIC_ISSUES - 1).padStart(4, "0")}`,
+  );
+  assert.ok(err.issues.every((i) => i.code === "measurement_invalid_type"));
+
+  // Explicit, machine-readable truncation summary.
+  assert.deepEqual(err.truncation, {
+    code: "issues_truncated",
+    limit: MAX_DIAGNOSTIC_ISSUES,
+    reported: MAX_DIAGNOSTIC_ISSUES,
+    remaining: keyCount - MAX_DIAGNOSTIC_ISSUES,
+  });
+
+  // Diagnostics stay bounded: the 422 payload is smaller than the request.
+  const payload = {
+    error: "validation_failed",
+    issues: err.issues,
+    truncated: err.truncation,
+  };
+  assert.ok(JSON.stringify(payload).length < JSON.stringify(body).length);
+
+  // Untrusted field values never enter the diagnostics.
+  assert.ok(!JSON.stringify(payload).includes("DO-NOT-ECHO"));
+});
+
+test("diagnostics below the cap report every exact path with no truncation", () => {
+  const body = {
+    batchId: "b",
+    records: [
+      {
+        recordId: "r1",
+        patientId: "p1",
+        accessionId: "a1",
+        relatedIds: ["r-missing"],
+        measurements: { bad: { x: 1 } },
+      },
+    ],
+  };
+  let thrown: unknown;
+  try {
+    validateBatch(body);
+  } catch (err) {
+    thrown = err;
+  }
+  assert.ok(thrown instanceof ValidationFailed);
+  const err = thrown as InstanceType<typeof ValidationFailed>;
+  assert.equal(err.truncation, null);
+  assert.ok(err.issues.length > 1 && err.issues.length <= MAX_DIAGNOSTIC_ISSUES);
+  const codes = err.issues.map((i) => i.code);
+  for (const code of ["measurement_invalid_type", "dangling_reference"]) {
+    assert.ok(codes.includes(code), `exact field issue ${code} must be present`);
   }
 });
 

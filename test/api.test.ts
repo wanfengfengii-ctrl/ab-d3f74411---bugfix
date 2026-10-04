@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAppServer } from "../src/http.ts";
 import { ManifestStore } from "../src/store.ts";
+import { MAX_DIAGNOSTIC_ISSUES } from "../src/diagnostics.ts";
+import { MAX_MEASUREMENT_KEYS } from "../src/validation.ts";
 
 const SECRET = Buffer.from("0123456789abcdef0123456789abcdef", "utf8");
 const RAW_IDS = ["R-100", "R-200", "PAT-X", "ACC-X"];
@@ -134,6 +136,70 @@ test("dangling references reject the whole batch with 422 and nothing is stored"
 
   const res = await fetch(`${baseUrl}/api/manifests/batch-dangling`);
   assert.equal(res.status, 404);
+});
+
+test("a thousand invalid measurement values get a bounded truncated 422 body", async () => {
+  const keyCount = 1000;
+  assert.ok(keyCount <= MAX_MEASUREMENT_KEYS);
+  const measurements: Record<string, unknown> = {};
+  for (let i = 0; i < keyCount; i++) {
+    measurements[`m${String(i).padStart(4, "0")}`] = { secretMarker: "DO-NOT-ECHO" };
+  }
+  const body = {
+    batchId: "batch-thousand",
+    records: [
+      { recordId: "R-T1", patientId: "P-T1", accessionId: "A-T1", relatedIds: [], measurements },
+    ],
+  };
+  const requestBytes = JSON.stringify(body).length;
+
+  const { status, json } = await post(body);
+  assert.equal(status, 422);
+  assert.equal(json.error, "validation_failed");
+  assert.ok(Array.isArray(json.issues));
+  assert.equal(json.issues.length, MAX_DIAGNOSTIC_ISSUES);
+  assert.deepEqual(json.truncated, {
+    code: "issues_truncated",
+    limit: MAX_DIAGNOSTIC_ISSUES,
+    reported: MAX_DIAGNOSTIC_ISSUES,
+    remaining: keyCount - MAX_DIAGNOSTIC_ISSUES,
+  });
+  // Deterministic field paths retained in key order.
+  assert.equal(json.issues[0].path, "records[0].measurements.m0000");
+  assert.equal(
+    json.issues.at(-1).path,
+    `records[0].measurements.m${String(MAX_DIAGNOSTIC_ISSUES - 1).padStart(4, "0")}`,
+  );
+  // The error response must not amplify the rejected request.
+  assert.ok(JSON.stringify(json).length < requestBytes, "422 body must stay bounded");
+  // No untrusted value and no raw identifier may appear.
+  const text = JSON.stringify(json);
+  assert.ok(!text.includes("DO-NOT-ECHO"), "422 body must not echo measurement values");
+  assert.ok(!text.includes("R-T1"));
+  // The whole batch is rejected, not stored.
+  const res = await fetch(`${baseUrl}/api/manifests/batch-thousand`);
+  assert.equal(res.status, 404);
+});
+
+test("few field errors return every exact path and no truncation marker", async () => {
+  const body = {
+    batchId: "batch-few-errors",
+    records: [
+      {
+        recordId: "R-F1",
+        patientId: "P-F1",
+        accessionId: "A-F1",
+        relatedIds: [],
+        measurements: { only: ["nested-array"] },
+      },
+    ],
+  };
+  const { status, json } = await post(body);
+  assert.equal(status, 422);
+  assert.equal(json.issues.length, 1);
+  assert.equal(json.issues[0].code, "measurement_invalid_type");
+  assert.equal(json.issues[0].path, "records[0].measurements.only");
+  assert.equal(json.truncated, undefined);
 });
 
 test("malformed JSON yields 400 and unknown batch yields 404", async () => {

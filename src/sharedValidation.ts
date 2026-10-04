@@ -2,9 +2,9 @@ import type {
   MeasurementValue,
   SharedManifest,
   SharedRecord,
-  ValidationIssue,
 } from "./types.ts";
 import { CorruptManifestError } from "./types.ts";
+import { IssueCollector } from "./diagnostics.ts";
 import {
   BATCH_ID_PATTERN,
   FORBIDDEN_KEYS,
@@ -37,7 +37,10 @@ import {
  *
  * As with the inbound validator, issues report JSON paths and rule codes
  * only, never the offending values: a corrupt entry may be precisely the
- * place where raw identifiers live.
+ * place where raw identifiers live. Both validators share the same
+ * deterministic diagnostic cap (see diagnostics.ts), so a corrupt entry
+ * containing thousands of invalid values can still only produce a bounded
+ * number of field-level issues plus a truncation summary.
  */
 
 const CREATED_AT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -45,18 +48,6 @@ const CONTENT_HASH_PATTERN = /^[0-9a-f]{64}$/;
 const RECORD_ALIAS_PATTERN = /^rec-[0-9a-f]{32}$/;
 const PATIENT_ALIAS_PATTERN = /^pat-[0-9a-f]{32}$/;
 const ACCESSION_ALIAS_PATTERN = /^acc-[0-9a-f]{32}$/;
-
-class IssueCollector {
-  readonly issues: ValidationIssue[] = [];
-
-  add(code: string, path: string, message: string): void {
-    this.issues.push({ code, path, message });
-  }
-
-  get ok(): boolean {
-    return this.issues.length === 0;
-  }
-}
 
 function isValidCreatedAt(value: string): boolean {
   if (!CREATED_AT_PATTERN.test(value)) return false;
@@ -202,8 +193,10 @@ function validateSharedRecord(
 
 /**
  * Validate a persisted shared manifest against the current contract.
- * Throws {@link CorruptManifestError} collecting every issue found; returns
- * the normalized manifest only when the document is fully contract-compliant.
+ * Throws {@link CorruptManifestError} on any violation; returns the normalized
+ * manifest only when the document is fully contract-compliant. The retained
+ * issue list is bounded by the shared diagnostic cap with a truncation
+ * summary when applicable.
  */
 export function validateSharedManifest(raw: unknown): SharedManifest {
   const issues = new IssueCollector();
@@ -286,7 +279,7 @@ export function validateSharedManifest(raw: unknown): SharedManifest {
     });
   });
 
-  if (!issues.ok) throw new CorruptManifestError(issues.issues);
+  if (!issues.ok) throw new CorruptManifestError(issues.issues, issues.summary());
   return {
     batchId,
     createdAt: raw.createdAt as string,

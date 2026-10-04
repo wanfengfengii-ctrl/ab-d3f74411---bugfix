@@ -46,14 +46,30 @@ export interface ValidationIssue {
   message: string;
 }
 
+/**
+ * Machine-readable marker appended when more issues were found than the
+ * shared diagnostic cap allows reporting. It never carries field values.
+ */
+export interface IssueTruncation {
+  code: "issues_truncated";
+  /** Number of field-level issues retained (the shared deterministic cap). */
+  limit: number;
+  /** Number of issues actually present in `issues` (always === limit here). */
+  reported: number;
+  /** Number of additional issues that were found but not expanded. */
+  remaining: number;
+}
+
 /** Payload failed structural / referential validation -> HTTP 422. */
 export class ValidationFailed extends Error {
   readonly issues: ValidationIssue[];
+  readonly truncation: IssueTruncation | null;
 
-  constructor(issues: ValidationIssue[]) {
+  constructor(issues: ValidationIssue[], truncation: IssueTruncation | null = null) {
     super("manifest validation failed");
     this.name = "ValidationFailed";
     this.issues = issues;
+    this.truncation = truncation;
   }
 }
 
@@ -65,11 +81,13 @@ export class ValidationFailed extends Error {
  */
 export class CorruptManifestError extends Error {
   readonly issues: ValidationIssue[];
+  readonly truncation: IssueTruncation | null;
 
-  constructor(issues: ValidationIssue[]) {
+  constructor(issues: ValidationIssue[], truncation: IssueTruncation | null = null) {
     super("persisted manifest failed recovery validation");
     this.name = "CorruptManifestError";
     this.issues = issues;
+    this.truncation = truncation;
   }
 }
 
